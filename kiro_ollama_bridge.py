@@ -21,6 +21,7 @@ Stdlib only. Binds to 127.0.0.1. Never logs the Authorization header.
 import argparse
 import http.client
 import json
+import queue
 import re
 import struct
 import sys
@@ -39,6 +40,20 @@ HOP_BY_HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authoriza
 CHARS_PER_TOKEN = 3.5   # rough estimate used only for the context-window guard
 THINK_CLOSE = "</think>"
 HOLD_CHARS = 3000       # how much leading text to hold back while checking for THINK_CLOSE
+KEEPALIVE_SECONDS = 15  # Kiro flags a stream as stalled after 60 s without an event
+OUTPUT_RESERVE = 1536   # tokens kept free for the reply in --slim mode
+
+# --slim: replace Kiro's ~20k-token system prompt and tool set with a small one
+SLIM_TOOLS = ["read_file", "fs_write", "str_replace", "fs_append", "grep_search",
+              "file_search", "list_directory", "execute_bash"]
+SLIM_SYSTEM = (
+    "You are a coding assistant running inside the Kiro IDE.\n"
+    "- Answer directly and briefly.\n"
+    "- Use the provided tools to read, search and edit files and to run commands. "
+    "Use absolute paths.\n"
+    "- Read a file before editing it. Make the smallest change that does the job.\n"
+    "- Never guess file contents; read them.\n"
+)
 
 CONFIG = {}            # filled in main()
 LOCAL_MODELS = {}      # kiro model id -> ollama model name
@@ -153,6 +168,35 @@ def ollama_chat_stream(model: str, messages: list, tools: list, think):
             yield ("done", chunk)
 
 
+def with_keepalive(events, interval: float = KEEPALIVE_SECONDS):
+    """Re-yield `events`, inserting ("keepalive",) whenever nothing arrives for
+    `interval` seconds. Ollama sends nothing while it reads a long prompt, and
+    Kiro treats a silent stream as stalled after 60 s and aborts it after 300 s."""
+    q, done = queue.Queue(), object()
+
+    def pump():
+        try:
+            for ev in events:
+                q.put(ev)
+        except Exception as e:   # re-raised in the caller's thread
+            q.put(e)
+        finally:
+            q.put(done)
+
+    threading.Thread(target=pump, daemon=True).start()
+    while True:
+        try:
+            item = q.get(timeout=interval)
+        except queue.Empty:
+            yield ("keepalive",)
+            continue
+        if item is done:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
 def context_overflow(messages: list, tools: list):
     """Return an explanation if the prompt clearly can't fit in num_ctx."""
     est = int(len(json.dumps(messages)) + len(json.dumps(tools))) / CHARS_PER_TOKEN
@@ -162,6 +206,96 @@ def context_overflow(messages: list, tools: list):
                 f"the start of the conversation. Start a new session, or restart the bridge "
                 f"with a larger --num-ctx if the model and your RAM allow it.")
     return None
+
+
+def est_tokens(obj) -> int:
+    return int(len(obj if isinstance(obj, str) else json.dumps(obj)) / CHARS_PER_TOKEN)
+
+
+def size_report(messages: list, tools: list) -> str:
+    system = sum(est_tokens(m["content"]) for m in messages if m["role"] == "system")
+    rest = sum(est_tokens(m) for m in messages if m["role"] != "system")
+    return f"~{system:,} tok system, ~{est_tokens(tools):,} tok tools, ~{rest:,} tok conversation"
+
+
+def _short(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    first = re.split(r"(?<=[.!?])\s|\n", text, maxsplit=1)[0]
+    return (first if len(first) <= limit else first[:limit - 1] + "…")
+
+
+def _strip_schema(schema):
+    """Drop descriptions and examples from a JSON schema to save tokens."""
+    if isinstance(schema, dict):
+        return {k: _strip_schema(v) for k, v in schema.items()
+                if k not in ("description", "examples", "default", "title")}
+    if isinstance(schema, list):
+        return [_strip_schema(v) for v in schema]
+    return schema
+
+
+def slim_request(messages: list, tools: list):
+    """Shrink Kiro's request so it fits a small --num-ctx.
+
+    * Kiro's system prompt -> SLIM_SYSTEM plus the workspace/OS lines from it.
+    * Tools -> the SLIM_TOOLS allow-list, one-line descriptions, bare schemas.
+    * Conversation -> oldest messages dropped, then large tool outputs
+      truncated, until it fits num_ctx minus OUTPUT_RESERVE.
+    """
+    original_system = "\n".join(m["content"] for m in messages if m["role"] == "system")
+    env = []
+    for pat in (r"workspace root is:?\s*(\S+)", r"Operating System:\s*([^\n]+)",
+                r"Shell:\s*([^\n]+)", r"Current date[^\n]*:\s*([^\n]+)", r"Date:\s*([^\n]+)"):
+        m = re.search(pat, original_system, re.I)
+        if m:
+            env.append(m.group(0).strip())
+    system = SLIM_SYSTEM + ("\nEnvironment:\n" + "\n".join(f"- {e}" for e in env) if env else "")
+
+    allowed = CONFIG["slim_tools"]
+    by_name = {t["function"]["name"]: t for t in tools}
+    slim_tools = [{"type": "function", "function": {
+        "name": n, "description": _short(by_name[n]["function"].get("description", ""), 160),
+        "parameters": _strip_schema(by_name[n]["function"].get("parameters") or {})}}
+        for n in allowed if n in by_name]
+
+    convo = [dict(m) for m in messages if m["role"] != "system"]
+    budget = CONFIG["num_ctx"] - OUTPUT_RESERVE - est_tokens(system) - est_tokens(slim_tools)
+
+    def total():
+        return sum(est_tokens(m) for m in convo)
+
+    dropped = 0
+    while len(convo) > 1 and total() > budget:
+        convo.pop(0)
+        dropped += 1
+        while len(convo) > 1 and convo[0]["role"] in ("tool", "assistant"):
+            convo.pop(0)    # never start with an orphaned tool result / reply
+            dropped += 1
+    truncated = 0
+    while total() > budget:
+        big = max(convo, key=lambda m: len(m.get("content") or ""))
+        content = big.get("content") or ""
+        if len(content) < 400:
+            break
+        over_chars = int((total() - budget) * CHARS_PER_TOKEN) + 200
+        keep = max(200, len(content) - over_chars)
+        big["content"] = content[:keep] + "\n[... truncated by kiro_ollama_bridge to fit context]"
+        truncated += 1
+    note = f"slim: {len(tools)}->{len(slim_tools)} tools"
+    if dropped:
+        note += f", dropped {dropped} old messages"
+    if truncated:
+        note += f", truncated {truncated} long messages"
+    return [{"role": "system", "content": system}] + convo, slim_tools, note
+
+
+def prepare(messages: list, tools: list, label: str):
+    """Log Kiro's request size, apply --slim if enabled, return (messages, tools)."""
+    log(f"[{label}] request size: {size_report(messages, tools)}")
+    if CONFIG["slim"]:
+        messages, tools, note = slim_request(messages, tools)
+        log(f"[{label}] {note} -> {size_report(messages, tools)}")
+    return messages, tools
 
 
 def _parse_args(value):
@@ -271,6 +405,12 @@ def gar_to_ollama(state: dict):
             if calls:
                 m["tool_calls"] = calls
             messages.append(m)
+    # Kiro sends its system prompt as the first user turn, acknowledged by the
+    # assistant ("I will follow these instructions."). Treat it as the system prompt.
+    if (len(messages) >= 2 and messages[0]["role"] == "user"
+            and messages[1]["role"] == "assistant" and not messages[1].get("tool_calls")
+            and "follow these instructions" in (messages[1]["content"] or "").lower()):
+        messages = [{"role": "system", "content": messages[0]["content"]}] + messages[2:]
     current = state["currentMessage"]["userInputMessage"]
     add_user(current)
     ctx = current.get("userInputMessageContext") or {}
@@ -439,6 +579,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _local_responses(self, req: dict, model_id: str, body_len: int):
         ollama_model = resolve_local(model_id)
         messages, tools, think, dropped = responses_to_ollama(req)
+        messages, tools = prepare(messages, tools, self.label)
         rid = "resp_" + uuid.uuid4().hex
         self._start_chunked(200, {"Content-Type": "text/event-stream",
                                   "x-amzn-requestid": str(uuid.uuid4())})
@@ -457,8 +598,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                                      "delta": problem})
         else:
             try:
-                for ev in ollama_chat_stream(ollama_model, messages, tools, think):
-                    if ev[0] == "thinking" and CONFIG["show_thinking"]:
+                for ev in with_keepalive(ollama_chat_stream(ollama_model, messages, tools, think)):
+                    if ev[0] == "keepalive":
+                        # an empty text delta resets Kiro's stream-idle watchdog
+                        self._sse("response.output_text.delta",
+                                  {"output_index": out_index, "content_index": 0, "delta": ""})
+                    elif ev[0] == "thinking" and CONFIG["show_thinking"]:
                         self._sse("response.reasoning_text.delta",
                                   {"output_index": out_index, "delta": ev[1]})
                     elif ev[0] == "text":
@@ -500,6 +645,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def _local_gar(self, state: dict, model_id: str, body_len: int):
         ollama_model = resolve_local(model_id)
         messages, tools = gar_to_ollama(state)
+        messages, tools = prepare(messages, tools, self.label)
         self._start_chunked(200, {"Content-Type": "application/vnd.amazon.eventstream",
                                   "x-amzn-requestid": str(uuid.uuid4())})
         log(f"[{self.label}] local /generateAssistantResponse {model_id} -> {ollama_model}: "
@@ -512,8 +658,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self._chunk(encode_event("assistantResponseEvent", {"content": problem}))
         else:
             try:
-                for ev in ollama_chat_stream(ollama_model, messages, tools, CONFIG["think"]):
-                    if ev[0] == "thinking" and CONFIG["show_thinking"]:
+                for ev in with_keepalive(ollama_chat_stream(ollama_model, messages, tools,
+                                                            CONFIG["think"])):
+                    if ev[0] == "keepalive":
+                        self._chunk(encode_event("assistantResponseEvent", {"content": ""}))
+                    elif ev[0] == "thinking" and CONFIG["show_thinking"]:
                         self._chunk(encode_event("reasoningContentEvent", {"text": ev[1]}))
                     elif ev[0] == "text":
                         n_text += len(ev[1])
@@ -563,10 +712,19 @@ def main():
                    help="Forward model thinking to Kiro as reasoning")
     p.add_argument("--include-cloud", action="store_true",
                    help="Also list Ollama ':cloud' models (they don't run locally)")
+    p.add_argument("--slim", action="store_true",
+                   help="Replace Kiro's ~20k-token system prompt and tool set with a small "
+                        "one and trim old turns, so small --num-ctx values (e.g. 8192) work")
+    p.add_argument("--slim-tools", default=",".join(SLIM_TOOLS),
+                   help="Comma-separated tools to keep in --slim mode")
     a = p.parse_args()
     CONFIG.update(ollama=a.ollama.rstrip("/"), num_ctx=a.num_ctx,
                   think={"on": True, "off": False, "default": None}[a.think],
-                  show_thinking=a.show_thinking, skip_cloud=not a.include_cloud)
+                  show_thinking=a.show_thinking, skip_cloud=not a.include_cloud,
+                  slim=a.slim,
+                  slim_tools=[t.strip() for t in a.slim_tools.split(",") if t.strip()])
+    if a.slim and a.num_ctx > 32768:
+        log("note: --slim is meant for small windows; pass e.g. --num-ctx 8192")
     log(f"local models: {[m['modelId'] for m in refresh_local_models()]}")
     serve(a.runtime_port, f"https://runtime.{a.region}.kiro.dev", "runtime")
     serve(a.management_port, f"https://management.{a.region}.kiro.dev", "management")

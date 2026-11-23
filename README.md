@@ -52,13 +52,35 @@ A server-side flag decides which chat path Kiro uses for your account, so the br
 | `--think on\|off\|default` | off | Ollama thinking. Off is much faster for agent turns. |
 | `--show-thinking` | off | Forward model thinking to Kiro as reasoning. |
 | `--include-cloud` | off | Also list Ollama `:cloud` models, which don't run locally. |
+| `--slim` | off | Replace Kiro's system prompt and tool set with a small one and trim old turns. Needed for small context windows. See [Slim mode](#slim-mode). |
+| `--slim-tools` | 8 core tools | Comma-separated tools to keep in slim mode. Default: `read_file,fs_write,str_replace,fs_append,grep_search,file_search,list_directory,execute_bash`. |
 | `--region` | us-east-1 | Which Kiro region to forward to. Use the region of your Kiro profile, and match it in the settings. |
 | `--runtime-port` / `--management-port` | 8787 / 8788 | Must match the settings. |
 | `--ollama` | `http://127.0.0.1:11434` | Ollama base URL. |
 
+## Slim mode
+
+Kiro sends about **20,000 tokens on every turn, even in a new session**: a long system prompt (about 18k tokens) plus 23 tool definitions (about 19k tokens of JSON, though Ollama counts somewhat fewer). A local model has to read all of it before it writes anything. A 27B model on Apple silicon reads roughly 100 tokens per second, so that's 3–4 minutes of silence per turn, and `--num-ctx` can't go below about 24k.
+
+`--slim` shrinks the request before it reaches Ollama:
+
+- **System prompt:** Kiro's prompt is replaced by a short coding-assistant prompt. It keeps the workspace root, OS and date lines from Kiro's prompt.
+- **Tools:** only the `--slim-tools` allow-list is kept, with one-line descriptions and schemas stripped of their descriptions.
+- **Conversation:** the oldest turns are dropped, then oversized tool outputs are truncated, until the request fits `--num-ctx` with room left for the reply.
+
+```bash
+nohup python3 kiro_ollama_bridge.py --slim --num-ctx 8192 > bridge.log 2>&1 &
+```
+
+In testing, a Kiro-sized request went from about 37,000 estimated tokens to about 650. The first answer arrived in 11 s instead of several minutes. The log shows the size of every request before and after slimming.
+
+**What slim mode loses.** The local model no longer sees Kiro's own instructions: steering files, specs, hooks guidance, and the rules for Kiro's other tools. It also loses any tools outside the allow-list, and anything said in turns that were dropped. It's a plain coding assistant with file and shell tools, not Kiro's full agent. Slim mode only affects `local-…` models; cloud models are untouched.
+
 ## Limits
 
-- **Context size.** Kiro's system prompt and tool definitions are large, and long sessions reach hundreds of thousands of tokens. When a prompt clearly won't fit `--num-ctx`, the bridge answers with an explanation instead of letting Ollama silently cut the start of the conversation. Use new sessions, and raise `--num-ctx` if your RAM allows.
+- **Context size.** Without `--slim`, Kiro's system prompt and tool definitions alone need about 20k tokens, and long sessions reach hundreds of thousands. When a prompt clearly won't fit `--num-ctx`, the bridge answers with an explanation instead of letting Ollama silently cut the start of the conversation. Use `--slim`, or new sessions with a larger `--num-ctx`.
+- **"Paused" or stalled turns.** Kiro marks a stream as stalled after 60 s without an event and aborts it after 300 s. The bridge sends a keepalive event every 15 s while Ollama is still reading the prompt, so slow models aren't cut off. Long waits are still normal without `--slim`.
+- **One request at a time.** Ollama processes requests for a model one after another, and loading a second large model can evict the first. Several sessions using local models at once will queue behind each other. Stick to one local model if your RAM can't hold two.
 - **Text only.** Images and file attachments are dropped for local models.
 - **Agent quality depends on the model.** Small models often handle Kiro's tool protocol poorly.
 - **No Kiro-side features for local turns.** Metering, prompt caching and reasoning replay apply only to cloud models.
