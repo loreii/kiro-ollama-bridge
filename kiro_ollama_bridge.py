@@ -528,16 +528,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if target.endswith(".ListAvailableModels") or \
                     path in ("/ListAvailableModels", "/List-Available-Models"):
                 return self._list_models(body)
-            if self.command == "POST" and body and path in ("/v1/responses",
-                                                            "/generateAssistantResponse"):
+            # Chat arrives in three forms: CreateResponse (/v1/responses), REST
+            # GenerateAssistantResponse, or RPC-style "POST /" with an
+            # X-Amz-Target header. Kiro can switch between them mid-session.
+            is_gar_rpc = target.endswith(".GenerateAssistantResponse")
+            if self.command == "POST" and body and (is_gar_rpc or path in (
+                    "/v1/responses", "/generateAssistantResponse")):
                 req = json.loads(body)
-                if path == "/v1/responses":
+                if path == "/v1/responses" and not is_gar_rpc:
                     model_id = req.get("model")
                 else:
                     model_id = ((req.get("conversationState") or {}).get("currentMessage", {})
                                 .get("userInputMessage", {}).get("modelId"))
                 if model_id and model_id.startswith(LOCAL_PREFIX):
-                    if path == "/v1/responses":
+                    if path == "/v1/responses" and not is_gar_rpc:
                         return self._local_responses(req, model_id, len(body))
                     return self._local_gar(req["conversationState"], model_id, len(body))
             return self._forward(body)
