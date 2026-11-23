@@ -1,0 +1,11 @@
+{
+  // Kiro <-> Ollama bridge test (kiro_ollama_bridge.py). Workspace-scoped: only
+  // windows that open this folder use it. Delete both keys and reload to undo.
+  // The bridge must be running BEFORE you reload, or chat in this window fails.
+  "codewhisperer.config.krsEndpoints": [
+    { "region": "us-east-1", "endpoint": "http://127.0.0.1:8787" }
+  ],
+  "codewhisperer.config.cpsEndpoints": [
+    { "region": "us-east-1", "endpoint": "http://127.0.0.1:8788" }
+  ]
+}
