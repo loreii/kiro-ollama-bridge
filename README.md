@@ -1,6 +1,6 @@
 # kiro-ollama-bridge
 
-Use local [Ollama](https://ollama.com) models in Kiro IDE, from Kiro's own model picker, next to your subscription's cloud models.
+Use local [Ollama](https://ollama.com) models, or any OpenAI-compatible endpoint, in Kiro IDE from Kiro's own model picker, next to your subscription's cloud models.
 
 ![Kiro model picker listing Local Ollama models at 0x credit below the cloud models](docs/kiro-model-picker-local-models.png)
 
@@ -11,8 +11,30 @@ Use local [Ollama](https://ollama.com) models in Kiro IDE, from Kiro's own model
 ## Requirements
 
 - Kiro IDE, signed in. Cloud models keep using your normal Kiro login and subscription.
-- Ollama running locally (`http://127.0.0.1:11434`) with at least one chat model. For agent work, choose a model with the `tools` capability.
+- A backend: Ollama running locally (`http://127.0.0.1:11434`), and/or any OpenAI-compatible `/v1/chat/completions` endpoint (see [OpenAI-compatible endpoints](#openai-compatible-endpoints)). For agent work, choose a model that supports tool calls.
 - Python 3.9+. The bridge uses only the standard library, so there's nothing to install.
+
+## OpenAI-compatible endpoints
+
+Besides Ollama, the bridge can expose any server that speaks the OpenAI `/v1/chat/completions` protocol (vLLM, LM Studio, llama.cpp server, Nanoattention, a remote host on your network, etc.). Add one or more with `--openai`:
+
+```bash
+# Nanoattention / Inkling 2 Mini on another machine
+NANOATTENTION_API_KEY=local python3 kiro_ollama_bridge.py \
+  --openai name=flint,url=http://10.31.7.73:8803/v1
+```
+
+The `SPEC` after `--openai` is comma-separated `key=value` pairs:
+
+| Key | Meaning |
+|---|---|
+| `url` | **Required.** The base URL ending in `/v1`. The bridge calls `<url>/chat/completions`. |
+| `name` | Label and id. Appears in Kiro as `Local <name>` with id `local-<name>`. Defaults to `model`, then the host. |
+| `model` | The model name the endpoint expects. Defaults to `name`. |
+| `ctx` | Context window reported to Kiro. Defaults to `--num-ctx`. |
+| `key` | Bearer token. Or use `key_env=VAR` to read it from an environment variable. Falls back to `$NANOATTENTION_API_KEY`, then `local`. |
+
+`--openai` is repeatable. OpenAI endpoints appear in the model picker just like Ollama models, and get the same `--slim`, keepalive and tool-call handling. Reasoning models that emit `<|...|>` control tokens have them stripped, and `<|content_thinking|>` output is routed to Kiro as reasoning.
 
 ## How it works
 
@@ -54,6 +76,7 @@ A server-side flag decides which chat path Kiro uses for your account, so the br
 | `--include-cloud` | off | Also list Ollama `:cloud` models, which don't run locally. |
 | `--slim` | off | Replace Kiro's system prompt and tool set with a small one and trim old turns. Needed for small context windows. See [Slim mode](#slim-mode). |
 | `--slim-tools` | 8 core tools | Comma-separated tools to keep in slim mode. Default: `read_file,fs_write,str_replace,fs_append,grep_search,file_search,list_directory,execute_bash`. |
+| `--openai SPEC` | none | Add an OpenAI-compatible endpoint. Repeatable. See [OpenAI-compatible endpoints](#openai-compatible-endpoints). |
 | `--region` | us-east-1 | Which Kiro region to forward to. Use the region of your Kiro profile, and match it in the settings. |
 | `--runtime-port` / `--management-port` | 8787 / 8788 | Must match the settings. |
 | `--ollama` | `http://127.0.0.1:11434` | Ollama base URL. |

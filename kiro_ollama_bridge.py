@@ -21,6 +21,7 @@ Stdlib only. Binds to 127.0.0.1. Never logs the Authorization header.
 import argparse
 import http.client
 import json
+import os
 import queue
 import re
 import struct
@@ -56,8 +57,10 @@ SLIM_SYSTEM = (
 )
 
 CONFIG = {}            # filled in main()
-LOCAL_MODELS = {}      # kiro model id -> ollama model name
+LOCAL_MODELS = {}      # kiro model id -> provider descriptor (see resolve_local)
 _models_lock = threading.Lock()
+# Control tokens some reasoning models (e.g. flint/Nanoattention) leak into content.
+CONTROL_TOKEN = re.compile(r"<\|[^|>]*\|>")
 
 
 def log(msg: str) -> None:
@@ -73,9 +76,9 @@ def refresh_local_models() -> list:
     try:
         with urllib.request.urlopen(CONFIG["ollama"] + "/api/tags", timeout=5) as r:
             tags = json.load(r).get("models", [])
-    except Exception as e:  # Ollama down: just show no local models
+    except Exception as e:  # Ollama down: still expose any OpenAI endpoints
         log(f"ollama unreachable: {e}")
-        return []
+        tags = []
     entries, mapping = [], {}
     for m in tags:
         caps = m.get("capabilities") or []
@@ -85,36 +88,55 @@ def refresh_local_models() -> list:
         if CONFIG["skip_cloud"] and name.endswith(":cloud"):
             continue
         kiro_id = LOCAL_PREFIX + re.sub(r"[^a-z0-9.]+", "-", name.lower()).strip("-")
-        mapping[kiro_id] = name
-        entries.append({
-            "modelId": kiro_id,
-            "modelName": f"Local {name}",
-            "description": f"Ollama model {name} via kiro_ollama_bridge"
-                           + ("" if "tools" in caps else " (no tool support)"),
-            "modelProvider": None,
-            "rateMultiplier": 0.0,
-            "rateUnit": "Credit",
-            "tokenLimits": {"maxInputTokens": CONFIG["num_ctx"], "maxOutputTokens": 32000},
-            "supportedInputTypes": ["TEXT"],
-            "additionalModelRequestFieldsSchema": None,
-            "availableOrigins": None, "consentDescription": None, "consentStatus": None,
-            "disclaimers": None, "promptCaching": None, "refusalFallbackModels": None,
-            "status": None, "termsUrl": None,
-        })
+        mapping[kiro_id] = {"kind": "ollama", "model": name, "ctx": CONFIG["num_ctx"]}
+        entries.append(model_entry(
+            kiro_id, f"Local {name}",
+            f"Ollama model {name} via kiro_ollama_bridge"
+            + ("" if "tools" in caps else " (no tool support)"),
+            CONFIG["num_ctx"]))
+    for kiro_id, prov in openai_providers().items():
+        mapping[kiro_id] = prov
+        entries.append(model_entry(kiro_id, prov["label"],
+                                   f"{prov['model']} via {prov['url']} (OpenAI-compatible)",
+                                   prov["ctx"]))
     with _models_lock:
         LOCAL_MODELS.clear()
         LOCAL_MODELS.update(mapping)
     return entries
 
 
+def model_entry(kiro_id: str, name: str, description: str, ctx: int) -> dict:
+    return {
+        "modelId": kiro_id, "modelName": name, "description": description,
+        "modelProvider": None, "rateMultiplier": 0.0, "rateUnit": "Credit",
+        "tokenLimits": {"maxInputTokens": ctx, "maxOutputTokens": 32000},
+        "supportedInputTypes": ["TEXT"], "additionalModelRequestFieldsSchema": None,
+        "availableOrigins": None, "consentDescription": None, "consentStatus": None,
+        "disclaimers": None, "promptCaching": None, "refusalFallbackModels": None,
+        "status": None, "termsUrl": None,
+    }
+
+
+def openai_providers() -> dict:
+    """Configured OpenAI-compatible endpoints, keyed by their Kiro model id."""
+    out = {}
+    for spec in CONFIG.get("openai", []):
+        kiro_id = LOCAL_PREFIX + re.sub(r"[^a-z0-9.]+", "-", spec["name"].lower()).strip("-")
+        out[kiro_id] = {"kind": "openai", "label": f"Local {spec['name']}",
+                        "url": spec["url"], "model": spec["model"],
+                        "key": spec["key"], "ctx": spec["ctx"]}
+    return out
+
+
 def resolve_local(model_id: str):
+    """Return the provider descriptor for a local model id, refreshing once if unseen."""
     with _models_lock:
-        name = LOCAL_MODELS.get(model_id)
-    if not name:
+        prov = LOCAL_MODELS.get(model_id)
+    if not prov:
         refresh_local_models()
         with _models_lock:
-            name = LOCAL_MODELS.get(model_id)
-    return name
+            prov = LOCAL_MODELS.get(model_id)
+    return prov
 
 
 def ollama_chat_stream(model: str, messages: list, tools: list, think):
@@ -166,6 +188,104 @@ def ollama_chat_stream(model: str, messages: list, tools: list, think):
             if held and not settled:
                 yield ("text", held)
             yield ("done", chunk)
+
+
+def to_openai(messages: list, tools: list):
+    """Convert the internal (Ollama-style) messages/tools to OpenAI chat format.
+
+    The internal format drops tool-call ids (Ollama pairs by name/order), so we
+    re-synthesize ids here and pair each tool result with the matching call id,
+    which OpenAI-compatible servers require."""
+    pending = {}   # tool name -> queue of call ids awaiting their result
+    out = []
+    for m in messages:
+        role = m.get("role")
+        if role == "tool":
+            name = m.get("tool_name", "tool")
+            cid = pending.get(name, []).pop(0) if pending.get(name) else \
+                "call_" + uuid.uuid4().hex[:24]
+            out.append({"role": "tool", "tool_call_id": cid, "content": m.get("content") or ""})
+        elif role == "assistant" and m.get("tool_calls"):
+            calls = []
+            for tc in m["tool_calls"]:
+                fn = tc.get("function") or {}
+                cid = "call_" + uuid.uuid4().hex[:24]
+                pending.setdefault(fn.get("name"), []).append(cid)
+                args = fn.get("arguments")
+                calls.append({"id": cid, "type": "function", "function": {
+                    "name": fn.get("name"),
+                    "arguments": args if isinstance(args, str) else json.dumps(args or {})}})
+            out.append({"role": "assistant", "content": m.get("content") or "",
+                        "tool_calls": calls})
+        else:
+            out.append({"role": role, "content": m.get("content") or ""})
+    return out, tools   # tool specs are already in OpenAI {type,function} shape
+
+
+def openai_chat_stream(provider: dict, messages: list, tools: list, think):
+    """Stream an OpenAI-compatible /chat/completions endpoint, yielding the same
+    ("thinking"|"text"|"tool"|"done") events as ollama_chat_stream."""
+    oai_msgs, oai_tools = to_openai(messages, tools)
+    body = {"model": provider["model"], "messages": oai_msgs, "stream": True,
+            "stream_options": {"include_usage": True}}
+    if oai_tools:
+        body["tools"] = oai_tools
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {provider['key']}"}
+    r = urllib.request.urlopen(urllib.request.Request(
+        provider["url"].rstrip("/") + "/chat/completions",
+        data=json.dumps(body).encode(), headers=headers), timeout=900)
+    calls = {}   # index -> {"name","args"}
+    stats, in_think = {}, False
+    for raw in r:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if chunk.get("usage"):
+            u = chunk["usage"]
+            stats = {"prompt_eval_count": u.get("prompt_tokens"),
+                     "eval_count": u.get("completion_tokens")}
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            content = delta.get("content")
+            if content:
+                # route <|content_thinking|> regions to reasoning, strip control tokens
+                if "<|content_thinking|>" in content:
+                    in_think = True
+                if "<|content_final|>" in content or "<|message_final|>" in content:
+                    in_think = False
+                clean = CONTROL_TOKEN.sub("", content)
+                if clean:
+                    yield ("thinking" if in_think else "text", clean)
+            for tc in delta.get("tool_calls") or []:
+                idx = tc.get("index", 0)
+                slot = calls.setdefault(idx, {"name": "", "args": ""})
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = fn["name"]
+                if fn.get("arguments"):
+                    slot["args"] += fn["arguments"]
+            if choice.get("finish_reason"):
+                for slot in calls.values():
+                    if slot["name"]:
+                        yield ("tool", slot["name"], slot["args"] or "{}")
+                calls = {}
+    yield ("done", stats)
+
+
+def chat_stream(provider: dict, messages: list, tools: list, think):
+    """Dispatch to the right backend; both yield the same event tuples."""
+    if provider["kind"] == "openai":
+        yield from openai_chat_stream(provider, messages, tools, think)
+    else:
+        yield from ollama_chat_stream(provider["model"], messages, tools, think)
 
 
 def with_keepalive(events, interval: float = KEEPALIVE_SECONDS):
@@ -581,7 +701,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self._chunk(f"event: {event}\ndata: {payload}\n\n".encode())
 
     def _local_responses(self, req: dict, model_id: str, body_len: int):
-        ollama_model = resolve_local(model_id)
+        provider = resolve_local(model_id)
+        backend = provider and (provider.get("model") if provider["kind"] == "ollama"
+                                else provider["url"])
         messages, tools, think, dropped = responses_to_ollama(req)
         messages, tools = prepare(messages, tools, self.label)
         rid = "resp_" + uuid.uuid4().hex
@@ -589,11 +711,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                   "x-amzn-requestid": str(uuid.uuid4())})
         self._sse("response.created", {"response": {"id": rid, "status": "in_progress",
                                                     "model": model_id}})
-        log(f"[{self.label}] local /v1/responses {model_id} -> {ollama_model}: "
+        log(f"[{self.label}] local /v1/responses {model_id} -> {backend}: "
             f"{len(messages)} msgs, {len(tools)} tools, body {body_len // 1024} KB"
             + (f", {dropped} non-text parts dropped" if dropped else ""))
         problem = (f"[kiro_ollama_bridge] Unknown local model {model_id}."
-                   if not ollama_model else context_overflow(messages, tools))
+                   if not provider else context_overflow(messages, tools))
         out_index, stats, started, n_text, n_tools = 0, {}, time.time(), 0, 0
         text_open = False
         if problem:
@@ -602,7 +724,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                                      "delta": problem})
         else:
             try:
-                for ev in with_keepalive(ollama_chat_stream(ollama_model, messages, tools, think)):
+                for ev in with_keepalive(chat_stream(provider, messages, tools, think)):
                     if ev[0] == "keepalive":
                         # an empty text delta resets Kiro's stream-idle watchdog
                         self._sse("response.output_text.delta",
@@ -647,23 +769,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     # ---- local chat: GenerateAssistantResponse (AWS event stream) -------
     def _local_gar(self, state: dict, model_id: str, body_len: int):
-        ollama_model = resolve_local(model_id)
+        provider = resolve_local(model_id)
+        backend = provider and (provider.get("model") if provider["kind"] == "ollama"
+                                else provider["url"])
         messages, tools = gar_to_ollama(state)
         messages, tools = prepare(messages, tools, self.label)
         self._start_chunked(200, {"Content-Type": "application/vnd.amazon.eventstream",
                                   "x-amzn-requestid": str(uuid.uuid4())})
-        log(f"[{self.label}] local /generateAssistantResponse {model_id} -> {ollama_model}: "
+        log(f"[{self.label}] local /generateAssistantResponse {model_id} -> {backend}: "
             f"{len(messages)} msgs, {len(tools)} tools, body {body_len // 1024} KB")
         problem = (f"[kiro_ollama_bridge] Unknown local model {model_id}."
-                   if not ollama_model else context_overflow(messages, tools))
+                   if not provider else context_overflow(messages, tools))
         stats, started, n_text, n_tools = {}, time.time(), 0, 0
         if problem:
             log(f"[{self.label}] refused: {problem}")
             self._chunk(encode_event("assistantResponseEvent", {"content": problem}))
         else:
             try:
-                for ev in with_keepalive(ollama_chat_stream(ollama_model, messages, tools,
-                                                            CONFIG["think"])):
+                for ev in with_keepalive(chat_stream(provider, messages, tools, CONFIG["think"])):
                     if ev[0] == "keepalive":
                         self._chunk(encode_event("assistantResponseEvent", {"content": ""}))
                     elif ev[0] == "thinking" and CONFIG["show_thinking"]:
@@ -702,8 +825,26 @@ def serve(port: int, upstream: str, label: str) -> ThreadingHTTPServer:
     return server
 
 
+def parse_openai_spec(spec: str, default_ctx: int = 32768) -> dict:
+    """Parse --openai name=flint,url=http://host:port/v1[,model=..][,ctx=..][,key=..|,key_env=..]."""
+    kv = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if "=" in part:
+            k, v = part.split("=", 1)
+            kv[k.strip()] = v.strip()
+    url = kv.get("url")
+    if not url:
+        sys.exit(f"--openai spec needs a url=: {spec!r}")
+    name = kv.get("name") or kv.get("model") or urllib.parse.urlsplit(url).hostname or "openai"
+    key = kv.get("key") or os.environ.get(kv.get("key_env", "")) \
+        or os.environ.get("NANOATTENTION_API_KEY") or "local"
+    return {"name": name, "url": url, "model": kv.get("model", name),
+            "key": key, "ctx": int(kv.get("ctx", default_ctx))}
+
+
 def main():
-    p = argparse.ArgumentParser(description="Kiro <-> Ollama local bridge")
+    p = argparse.ArgumentParser(description="Kiro <-> Ollama / OpenAI-compatible local bridge")
     p.add_argument("--region", default="us-east-1")
     p.add_argument("--runtime-port", type=int, default=8787)
     p.add_argument("--management-port", type=int, default=8788)
@@ -721,11 +862,16 @@ def main():
                         "one and trim old turns, so small --num-ctx values (e.g. 8192) work")
     p.add_argument("--slim-tools", default=",".join(SLIM_TOOLS),
                    help="Comma-separated tools to keep in --slim mode")
+    p.add_argument("--openai", action="append", default=[], metavar="SPEC",
+                   help="Add an OpenAI-compatible endpoint. Repeatable. "
+                        "SPEC = name=<label>,url=<base/v1>[,model=<id>][,ctx=<n>][,key=<k>|,key_env=<VAR>]. "
+                        "Example: --openai name=flint,url=http://10.31.7.73:8803/v1")
     a = p.parse_args()
+    openai_specs = [parse_openai_spec(s, a.num_ctx) for s in a.openai]
     CONFIG.update(ollama=a.ollama.rstrip("/"), num_ctx=a.num_ctx,
                   think={"on": True, "off": False, "default": None}[a.think],
                   show_thinking=a.show_thinking, skip_cloud=not a.include_cloud,
-                  slim=a.slim,
+                  slim=a.slim, openai=openai_specs,
                   slim_tools=[t.strip() for t in a.slim_tools.split(",") if t.strip()])
     if a.slim and a.num_ctx > 32768:
         log("note: --slim is meant for small windows; pass e.g. --num-ctx 8192")
